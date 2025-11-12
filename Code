@@ -1,0 +1,581 @@
+# Maze Generator and Solver Visualizer
+# Auto-installs pygame if needed, then runs complete maze visualization
+
+try:
+    import pygame
+except ImportError:
+    import os, sys, subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "pygame"])
+    import pygame
+
+import random
+import heapq
+from typing import Tuple, List, Set, Optional, Generator
+from collections import deque
+from enum import Enum
+
+
+class CellType(Enum):
+    """Types of cells in the grid"""
+    EMPTY = 0
+    WALL = 1
+    START = 2
+    GOAL = 3
+    FRONTIER = 4
+    VISITED = 5
+    PATH = 6
+
+
+class Colors:
+    """Color palette for visualization"""
+    EMPTY = (255, 255, 255)
+    WALL = (40, 40, 40)
+    START = (0, 255, 0)
+    GOAL = (255, 0, 0)
+    FRONTIER = (135, 206, 250)
+    VISITED = (176, 224, 230)
+    PATH = (255, 215, 0)
+    GRID_LINE = (200, 200, 200)
+    TEXT = (0, 0, 0)
+    BG = (240, 240, 240)
+
+
+class Grid:
+    """Manages the maze grid state"""
+    
+    def __init__(self, width: int, height: int, cell_size: int):
+        self.width = width
+        self.height = height
+        self.cell_size = cell_size
+        self.cells = [[CellType.EMPTY for _ in range(width)] for _ in range(height)]
+        self.start: Optional[Tuple[int, int]] = None
+        self.goal: Optional[Tuple[int, int]] = None
+        self.frontier: Set[Tuple[int, int]] = set()
+        self.visited: Set[Tuple[int, int]] = set()
+        self.path: List[Tuple[int, int]] = []
+        
+    def clear(self):
+        """Clear the entire grid"""
+        self.cells = [[CellType.EMPTY for _ in range(self.width)] for _ in range(self.height)]
+        self.start = None
+        self.goal = None
+        self.reset_search()
+        
+    def reset_search(self):
+        """Reset search visualization but keep walls, start, and goal"""
+        self.frontier.clear()
+        self.visited.clear()
+        self.path.clear()
+        
+    def is_valid(self, x: int, y: int) -> bool:
+        """Check if coordinates are within grid bounds"""
+        return 0 <= x < self.width and 0 <= y < self.height
+        
+    def is_walkable(self, x: int, y: int) -> bool:
+        """Check if cell can be walked through"""
+        return self.is_valid(x, y) and self.cells[y][x] != CellType.WALL
+        
+    def get_neighbors(self, x: int, y: int) -> List[Tuple[int, int]]:
+        """Get valid walkable neighbors (4-directional)"""
+        neighbors = []
+        for dx, dy in [(0, 1), (1, 0), (0, -1), (-1, 0)]:
+            nx, ny = x + dx, y + dy
+            if self.is_walkable(nx, ny):
+                neighbors.append((nx, ny))
+        return neighbors
+        
+    def toggle_wall(self, x: int, y: int):
+        """Toggle wall at position"""
+        if (x, y) == self.start or (x, y) == self.goal:
+            return
+        if self.cells[y][x] == CellType.WALL:
+            self.cells[y][x] = CellType.EMPTY
+        else:
+            self.cells[y][x] = CellType.WALL
+            
+    def set_start(self, x: int, y: int):
+        """Set start position"""
+        if self.cells[y][x] != CellType.WALL and (x, y) != self.goal:
+            if self.start:
+                sx, sy = self.start
+                self.cells[sy][sx] = CellType.EMPTY
+            self.start = (x, y)
+            self.cells[y][x] = CellType.START
+            
+    def set_goal(self, x: int, y: int):
+        """Set goal position"""
+        if self.cells[y][x] != CellType.WALL and (x, y) != self.start:
+            if self.goal:
+                gx, gy = self.goal
+                self.cells[gy][gx] = CellType.EMPTY
+            self.goal = (x, y)
+            self.cells[y][x] = CellType.GOAL
+
+
+class MazeGenerator:
+    """Generates mazes using recursive backtracker algorithm"""
+    
+    @staticmethod
+    def generate(grid: Grid) -> Generator[None, None, None]:
+        """Generate a perfect maze using DFS"""
+        # Fill with walls
+        for y in range(grid.height):
+            for x in range(grid.width):
+                grid.cells[y][x] = CellType.WALL
+                
+        # Start from random odd position
+        start_x = random.randrange(1, grid.width, 2)
+        start_y = random.randrange(1, grid.height, 2)
+        
+        stack = [(start_x, start_y)]
+        grid.cells[start_y][start_x] = CellType.EMPTY
+        
+        while stack:
+            x, y = stack[-1]
+            
+            # Get unvisited neighbors (2 cells away)
+            neighbors = []
+            for dx, dy in [(0, 2), (2, 0), (0, -2), (-2, 0)]:
+                nx, ny = x + dx, y + dy
+                if grid.is_valid(nx, ny) and grid.cells[ny][nx] == CellType.WALL:
+                    neighbors.append((nx, ny, dx, dy))
+                    
+            if neighbors:
+                nx, ny, dx, dy = random.choice(neighbors)
+                # Carve path
+                grid.cells[y + dy // 2][x + dx // 2] = CellType.EMPTY
+                grid.cells[ny][nx] = CellType.EMPTY
+                stack.append((nx, ny))
+                yield
+            else:
+                stack.pop()
+                yield
+                
+        # Set random start and goal
+        empty_cells = [(x, y) for y in range(grid.height) for x in range(grid.width) 
+                      if grid.cells[y][x] == CellType.EMPTY]
+        if len(empty_cells) >= 2:
+            start_pos = random.choice(empty_cells)
+            empty_cells.remove(start_pos)
+            goal_pos = random.choice(empty_cells)
+            grid.set_start(*start_pos)
+            grid.set_goal(*goal_pos)
+
+
+class Solver:
+    """Base class for pathfinding algorithms"""
+    
+    def __init__(self, grid: Grid, name: str):
+        self.grid = grid
+        self.name = name
+        self.steps = 0
+        
+    def solve(self) -> Generator[bool, None, None]:
+        """Generator that yields at each step. Returns True if path found."""
+        raise NotImplementedError
+        
+    def reconstruct_path(self, came_from: dict, current: Tuple[int, int]) -> List[Tuple[int, int]]:
+        """Reconstruct path from came_from dictionary"""
+        path = []
+        while current in came_from:
+            path.append(current)
+            current = came_from[current]
+        path.reverse()
+        return path
+
+
+class BFSSolver(Solver):
+    """Breadth-First Search solver"""
+    
+    def __init__(self, grid: Grid):
+        super().__init__(grid, "BFS")
+        
+    def solve(self) -> Generator[bool, None, None]:
+        if not self.grid.start or not self.grid.goal:
+            return False
+            
+        queue = deque([self.grid.start])
+        came_from = {}
+        self.grid.visited.add(self.grid.start)
+        
+        while queue:
+            current = queue.popleft()
+            self.steps += 1
+            
+            if current == self.grid.goal:
+                self.grid.path = self.reconstruct_path(came_from, current)
+                yield True
+                return True
+                
+            for neighbor in self.grid.get_neighbors(*current):
+                if neighbor not in self.grid.visited:
+                    self.grid.visited.add(neighbor)
+                    self.grid.frontier.add(neighbor)
+                    came_from[neighbor] = current
+                    queue.append(neighbor)
+                    
+            if current in self.grid.frontier:
+                self.grid.frontier.remove(current)
+            yield False
+            
+        return False
+
+
+class DFSSolver(Solver):
+    """Depth-First Search solver"""
+    
+    def __init__(self, grid: Grid):
+        super().__init__(grid, "DFS")
+        
+    def solve(self) -> Generator[bool, None, None]:
+        if not self.grid.start or not self.grid.goal:
+            return False
+            
+        stack = [self.grid.start]
+        came_from = {}
+        self.grid.visited.add(self.grid.start)
+        
+        while stack:
+            current = stack.pop()
+            self.steps += 1
+            
+            if current == self.grid.goal:
+                self.grid.path = self.reconstruct_path(came_from, current)
+                yield True
+                return True
+                
+            for neighbor in self.grid.get_neighbors(*current):
+                if neighbor not in self.grid.visited:
+                    self.grid.visited.add(neighbor)
+                    self.grid.frontier.add(neighbor)
+                    came_from[neighbor] = current
+                    stack.append(neighbor)
+                    
+            if current in self.grid.frontier:
+                self.grid.frontier.remove(current)
+            yield False
+            
+        return False
+
+
+class DijkstraSolver(Solver):
+    """Dijkstra's algorithm solver"""
+    
+    def __init__(self, grid: Grid):
+        super().__init__(grid, "Dijkstra")
+        
+    def solve(self) -> Generator[bool, None, None]:
+        if not self.grid.start or not self.grid.goal:
+            return False
+            
+        heap = [(0, self.grid.start)]
+        came_from = {}
+        cost_so_far = {self.grid.start: 0}
+        
+        while heap:
+            current_cost, current = heapq.heappop(heap)
+            self.steps += 1
+            
+            if current in self.grid.visited:
+                continue
+                
+            self.grid.visited.add(current)
+            if current in self.grid.frontier:
+                self.grid.frontier.remove(current)
+                
+            if current == self.grid.goal:
+                self.grid.path = self.reconstruct_path(came_from, current)
+                yield True
+                return True
+                
+            for neighbor in self.grid.get_neighbors(*current):
+                new_cost = cost_so_far[current] + 1
+                if neighbor not in cost_so_far or new_cost < cost_so_far[neighbor]:
+                    cost_so_far[neighbor] = new_cost
+                    came_from[neighbor] = current
+                    heapq.heappush(heap, (new_cost, neighbor))
+                    if neighbor not in self.grid.visited:
+                        self.grid.frontier.add(neighbor)
+                        
+            yield False
+            
+        return False
+
+
+class AStarSolver(Solver):
+    """A* algorithm solver"""
+    
+    def __init__(self, grid: Grid):
+        super().__init__(grid, "A*")
+        
+    def heuristic(self, a: Tuple[int, int], b: Tuple[int, int]) -> float:
+        """Manhattan distance heuristic"""
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+        
+    def solve(self) -> Generator[bool, None, None]:
+        if not self.grid.start or not self.grid.goal:
+            return False
+            
+        heap = [(0, self.grid.start)]
+        came_from = {}
+        g_score = {self.grid.start: 0}
+        
+        while heap:
+            _, current = heapq.heappop(heap)
+            self.steps += 1
+            
+            if current in self.grid.visited:
+                continue
+                
+            self.grid.visited.add(current)
+            if current in self.grid.frontier:
+                self.grid.frontier.remove(current)
+                
+            if current == self.grid.goal:
+                self.grid.path = self.reconstruct_path(came_from, current)
+                yield True
+                return True
+                
+            for neighbor in self.grid.get_neighbors(*current):
+                tentative_g = g_score[current] + 1
+                if neighbor not in g_score or tentative_g < g_score[neighbor]:
+                    g_score[neighbor] = tentative_g
+                    f_score = tentative_g + self.heuristic(neighbor, self.grid.goal)
+                    came_from[neighbor] = current
+                    heapq.heappush(heap, (f_score, neighbor))
+                    if neighbor not in self.grid.visited:
+                        self.grid.frontier.add(neighbor)
+                        
+            yield False
+            
+        return False
+
+
+class App:
+    """Main application class"""
+    
+    def __init__(self, width: int = 800, height: int = 800, grid_size: int = 40):
+        pygame.init()
+        self.width = width
+        self.height = height
+        self.hud_height = 150
+        self.screen = pygame.display.set_mode((width, height + self.hud_height))
+        pygame.display.set_caption("Maze Generator & Solver")
+        self.clock = pygame.time.Clock()
+        self.font = pygame.font.Font(None, 24)
+        self.small_font = pygame.font.Font(None, 18)
+        
+        cell_size = width // grid_size
+        self.grid = Grid(grid_size, grid_size, cell_size)
+        
+        self.running = True
+        self.solver: Optional[Solver] = None
+        self.solver_gen: Optional[Generator] = None
+        self.maze_gen: Optional[Generator] = None
+        self.paused = False
+        self.delay = 10  # ms delay between steps
+        self.last_step = 0
+        self.path_found = False
+        self.no_path = False
+        self.setting_start = True
+        
+    def handle_events(self):
+        """Handle user input events"""
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.running = False
+                
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                x, y = event.pos
+                if y >= self.height:
+                    continue
+                grid_x = x // self.grid.cell_size
+                grid_y = y // self.grid.cell_size
+                
+                if event.button == 1:  # Left click - set start/goal
+                    if self.setting_start:
+                        self.grid.set_start(grid_x, grid_y)
+                        self.setting_start = False
+                    else:
+                        self.grid.set_goal(grid_x, grid_y)
+                        self.setting_start = True
+                elif event.button == 3:  # Right click - toggle wall
+                    self.grid.toggle_wall(grid_x, grid_y)
+                    
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    self.running = False
+                elif event.key == pygame.K_g:
+                    self.grid.clear()
+                    self.maze_gen = MazeGenerator.generate(self.grid)
+                    self.solver = None
+                    self.solver_gen = None
+                elif event.key == pygame.K_e:
+                    self.grid.clear()
+                    self.solver = None
+                    self.solver_gen = None
+                elif event.key == pygame.K_r:
+                    self.grid.reset_search()
+                    self.solver = None
+                    self.solver_gen = None
+                    self.path_found = False
+                    self.no_path = False
+                elif event.key == pygame.K_SPACE:
+                    self.paused = not self.paused
+                elif event.key == pygame.K_s and self.paused and self.solver_gen:
+                    try:
+                        self.path_found = next(self.solver_gen)
+                    except StopIteration:
+                        self.no_path = True
+                        self.solver_gen = None
+                elif event.key == pygame.K_PLUS or event.key == pygame.K_EQUALS:
+                    self.delay = max(0, self.delay - 5)
+                elif event.key == pygame.K_MINUS:
+                    self.delay = min(200, self.delay + 5)
+                elif event.key == pygame.K_1:
+                    self.start_solver(BFSSolver(self.grid))
+                elif event.key == pygame.K_2:
+                    self.start_solver(DFSSolver(self.grid))
+                elif event.key == pygame.K_3:
+                    self.start_solver(DijkstraSolver(self.grid))
+                elif event.key == pygame.K_4:
+                    self.start_solver(AStarSolver(self.grid))
+                    
+    def start_solver(self, solver: Solver):
+        """Start a new solver"""
+        if not self.grid.start or not self.grid.goal:
+            return
+        self.grid.reset_search()
+        self.solver = solver
+        self.solver_gen = solver.solve()
+        self.path_found = False
+        self.no_path = False
+        self.paused = False
+        
+    def update(self):
+        """Update application state"""
+        current_time = pygame.time.get_ticks()
+        
+        # Update maze generation
+        if self.maze_gen:
+            try:
+                next(self.maze_gen)
+            except StopIteration:
+                self.maze_gen = None
+                
+        # Update solver
+        if self.solver_gen and not self.paused and current_time - self.last_step >= self.delay:
+            try:
+                self.path_found = next(self.solver_gen)
+            except StopIteration:
+                self.no_path = True
+                self.solver_gen = None
+            self.last_step = current_time
+            
+    def draw_grid(self):
+        """Draw the grid and cells"""
+        for y in range(self.grid.height):
+            for x in range(self.grid.width):
+                rect = pygame.Rect(
+                    x * self.grid.cell_size,
+                    y * self.grid.cell_size,
+                    self.grid.cell_size,
+                    self.grid.cell_size
+                )
+                
+                # Determine cell color
+                if (x, y) == self.grid.start:
+                    color = Colors.START
+                elif (x, y) == self.grid.goal:
+                    color = Colors.GOAL
+                elif (x, y) in self.grid.path:
+                    color = Colors.PATH
+                elif (x, y) in self.grid.frontier:
+                    color = Colors.FRONTIER
+                elif (x, y) in self.grid.visited:
+                    color = Colors.VISITED
+                elif self.grid.cells[y][x] == CellType.WALL:
+                    color = Colors.WALL
+                else:
+                    color = Colors.EMPTY
+                    
+                pygame.draw.rect(self.screen, color, rect)
+                pygame.draw.rect(self.screen, Colors.GRID_LINE, rect, 1)
+                
+    def draw_hud(self):
+        """Draw HUD with information and legend"""
+        hud_rect = pygame.Rect(0, self.height, self.width, self.hud_height)
+        pygame.draw.rect(self.screen, Colors.BG, hud_rect)
+        pygame.draw.line(self.screen, Colors.TEXT, (0, self.height), (self.width, self.height), 2)
+        
+        y_offset = self.height + 10
+        
+        # Algorithm info
+        if self.solver:
+            algo_text = f"Algorithm: {self.solver.name} | Steps: {self.solver.steps}"
+            if self.path_found:
+                algo_text += f" | Path Length: {len(self.grid.path)}"
+            elif self.no_path:
+                algo_text += " | No path found"
+            text = self.font.render(algo_text, True, Colors.TEXT)
+            self.screen.blit(text, (10, y_offset))
+        else:
+            text = self.font.render("Select algorithm: 1=BFS 2=DFS 3=Dijkstra 4=A*", True, Colors.TEXT)
+            self.screen.blit(text, (10, y_offset))
+            
+        y_offset += 35
+        
+        # Controls
+        status = "PAUSED (press S to step)" if self.paused else f"Speed: {self.delay}ms delay (+/- to adjust)"
+        text = self.small_font.render(status, True, Colors.TEXT)
+        self.screen.blit(text, (10, y_offset))
+        
+        y_offset += 25
+        controls = "G=Maze | E=Clear | R=Reset | SPACE=Pause | L-Click=Start/Goal | R-Click=Wall"
+        text = self.small_font.render(controls, True, Colors.TEXT)
+        self.screen.blit(text, (10, y_offset))
+
+        y_offset += 22
+        controls2 = "L-Click=Start/Goal | R-Click=Wall"
+        text = self.small_font.render(controls2, True, Colors.TEXT)
+        self.screen.blit(text, (10, y_offset))
+        
+        # Legend
+        legend_x = self.width - 75
+        legend_y = self.height + 10
+        legend_items = [
+            ("Start", Colors.START),
+            ("Goal", Colors.GOAL),
+            ("Frontier", Colors.FRONTIER),
+            ("Visited", Colors.VISITED),
+            ("Path", Colors.PATH),
+            ("Wall", Colors.WALL)
+        ]
+        
+        for i, (label, color) in enumerate(legend_items):
+            y = legend_y + i * 20
+            pygame.draw.rect(self.screen, color, (legend_x, y, 15, 15))
+            text = self.small_font.render(label, True, Colors.TEXT)
+            self.screen.blit(text, (legend_x + 20, y))
+            
+    def draw(self):
+        """Draw everything"""
+        self.screen.fill(Colors.BG)
+        self.draw_grid()
+        self.draw_hud()
+        pygame.display.flip()
+        
+    def run(self):
+        """Main game loop"""
+        while self.running:
+            self.handle_events()
+            self.update()
+            self.draw()
+            self.clock.tick(60)
+            
+        pygame.quit()
+
+
+if __name__ == "__main__":
+    app = App(width=550, height=550, grid_size=30)
+    app.run()
